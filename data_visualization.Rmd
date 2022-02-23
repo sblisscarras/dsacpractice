@@ -1,0 +1,336 @@
+---
+title: "DSAC: Data visualization walkthrough"
+subtitle: "Using ggplot2"
+author: "Jack Lichtenstein"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, 
+                      echo = TRUE, dpi = 300, cache.lazy = FALSE,
+                      tidy = "styler", fig.width = 8, fig.height = 5)
+```
+
+## Loading libraries
+
+We are going to be working with R through the [tidyverse](https://www.tidyverse.org/)!
+
+```{r load libraries}
+library(tidyverse)
+theme_set(theme_light()) # setting a theme for ggplot2
+```
+
+## Load data
+
+The data we are going to be working with comes from the [`gamezoneR`](https://jacklich10.github.io/gamezoneR/index.html) package. The package can be used to load in play-by-play data of men's college basketball games, all with charted shot locations.
+
+```{r}
+# If gamezoneR is not installed, install
+if (!require("gamezoneR")) {
+  devtools::install_github(repo = "JackLich10/gamezoneR")
+}
+
+# Load in play-by-play data from this season
+pbp <- gamezoneR::load_gamezone_pbp(seasons = "2021-22")
+
+# Get a view of the data
+head(pbp)
+```
+
+First, we're going to perform some data wrangling to create some useful datasets for later visualizations and exploration.
+
+```{r}
+# Create a dictionary of available games
+single_games <- pbp %>% 
+  dplyr::group_by(game_id) %>% 
+  dplyr::summarise(dplyr::across(c(date, home, away), unique),
+                   dplyr::across(c(home_score, away_score), max),
+                   .groups = "drop") %>% 
+  dplyr::mutate(label = paste0(away, " @ ", home))
+
+# Bind together such that it is one row per team (as opposed to one row per game)
+games <- dplyr::bind_rows(
+  single_games %>% 
+    dplyr::transmute(game_id, date, label, team = home, opponent = away,
+                     team_score = home_score, opponent_score = away_score, location = "home"),
+  
+  single_games %>% 
+    dplyr::transmute(game_id, date, label, team = away, opponent = home,
+                     team_score = away_score, opponent_score = home_score, location = "away")
+) %>% 
+  dplyr::arrange(date)
+```
+
+```{r}
+# Function to summarize statistics from play-by-play data
+summarise_games <- function(tbl) {
+  tbl %>% 
+    dplyr::filter(!is.na(poss_before)) %>%
+    dplyr::mutate(poss_number = as.numeric(poss_number),
+                  shot_made_numeric = dplyr::case_when(
+                    is.na(shot_outcome) ~ NA_real_,
+                    shot_outcome == "made" ~ 1,
+                    shot_outcome == "missed" ~ 0),
+                  shot_value = dplyr::case_when(
+                    is.na(shot_outcome) ~ NA_real_,
+                    free_throw == 1 ~ 1,
+                    three_pt == 1 ~ 3,
+                    TRUE ~ 2),
+                  points = dplyr::case_when(
+                    shot_made_numeric == 0 ~ 0,
+                    shot_made_numeric == 1 & free_throw == 1 ~ 1,
+                    shot_made_numeric == 1 & three_pt == 1 ~ 3,
+                    shot_made_numeric == 1 & three_pt == 0 & free_throw == 0 ~ 2)) %>%
+    dplyr::group_by(date, game_id, poss_before, poss_number) %>%
+    dplyr::summarise(fgm = sum(shot_outcome == "made" & free_throw == FALSE, na.rm = TRUE),
+                     fga = sum(!is.na(shot_outcome) & free_throw == FALSE),
+                     ftm = sum(shot_outcome == "made" & free_throw == TRUE),
+                     fta = sum(!is.na(shot_outcome) & free_throw == TRUE),
+                     points = sum(points, na.rm = TRUE),
+                     .groups = "drop") %>%
+    dplyr::group_by(date, game_id, team = poss_before) %>%
+    dplyr::summarise(poss = dplyr::n(),
+                     dplyr::across(fgm:points, sum),
+                     .groups = "drop") %>% 
+    dplyr::mutate(pts_per_poss = points/poss)
+}
+```
+
+```{r}
+# Summarize stats from each game
+games_summarized <- pbp %>% 
+  summarise_games() %>% 
+  dplyr::left_join(games, by = c("date", "game_id", "team"))
+```
+
+Take a second to familiarize with yourself with the datasets we created (`single_games`, `games`, `games_summarized`, `pbp`). We are going to try to answer some interesting questions by creating visualizations!
+
+#### Make a visualization to show Duke's (cumulative) point differential over the course of the season.
+
+```{r}
+games %>% 
+  filter(team == "Duke") %>% 
+  mutate(cum_pt_diff = cumsum(team_score - opponent_score)) %>% 
+  ggplot(aes(date, cum_pt_diff)) +
+  geom_line()
+```
+
+#### Make visualizations to determine the effect of home court advantage.
+
+```{r}
+games %>% 
+  ggplot(aes(team_score, fill = location)) +
+  geom_histogram(position = "identity", alpha = 0.5) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = "Points",
+       y = NULL,
+       fill = NULL,
+       title = "Home court advantage is alive and well",
+       subtitle = "2021-22 men's college basketball season")
+```
+
+#### How has offensive efficiency (measured by points per possession) changed over the course of the season?
+
+```{r}
+games_summarized
+```
+
+#### Make visualizations to show which teams have the best offensive efficiency.
+
+```{r}
+off_eff <- games_summarized %>% 
+  group_by(team) %>% 
+  summarise(games = n(),
+            off_pts_per_poss = sum(pts_per_poss*poss)/sum(poss)) 
+
+off_eff %>% 
+  filter(games > 20) %>% 
+  slice_max(off_pts_per_poss, n = 10) %>% 
+  mutate(team = fct_reorder(team, off_pts_per_poss)) %>% 
+  ggplot(aes(off_pts_per_poss, team)) +
+  geom_col() +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05)))
+```
+
+#### Make a scatter plot with team offensive efficiency on the x-axis and team defensive efficiency on the y-axis. Size the points by the number of possessions charted. Use the `ggrepel` package to label the points by team name.
+
+```{r}
+def_eff <- games_summarized %>% 
+  group_by(team = opponent) %>% 
+  summarise(games = n(),
+            def_pts_per_poss = sum(pts_per_poss*poss)/sum(poss)) 
+
+efficiencies <- off_eff %>% 
+  left_join(def_eff, by = c("team", "games")) %>% 
+  filter(games >= 10) %>% 
+  left_join(gamezoneR::mbb_team_info, by = c("team" = "game_zone")) 
+
+efficiencies %>% 
+  ggplot(aes(off_pts_per_poss, def_pts_per_poss)) +
+  geom_point(aes(size = games,
+                 color = secondary_color, fill = primary_color),
+             pch = 21, stroke = 0.8) +
+  ggrepel::geom_text_repel(aes(label = team),
+                           size = 3) +
+  scale_y_reverse() +
+  scale_size_continuous(range = c(0.5, 3)) +
+  scale_fill_identity() +
+  scale_color_identity() +
+  labs(x = "Offensive Efficiency",
+       y = "Defensive Efficiency")
+
+efficiencies %>% 
+  ggplot(aes(off_pts_per_poss, def_pts_per_poss)) +
+  geom_point(aes(size = games,
+                 color = secondary_color, fill = primary_color,
+                 alpha = ifelse(team %in% c("Duke", "North Carolina"), 0, 0.2)),
+             pch = 21, stroke = 0.8) +
+  # ggrepel::geom_text_repel(aes(label = ifelse(team %in% c("Duke", "North Carolina"), team, NA_character_)),
+  #                          size = 3) +
+  ggimage::geom_image(aes(image = ifelse(team %in% c("Duke", "North Carolina"), team_logo_espn, NA_character_)),
+                      size = 0.075) +
+  theme(aspect.ratio = 9/11) +
+  scale_y_reverse() +
+  scale_alpha_identity() +
+  scale_size_continuous(range = c(0.5, 3)) +
+  scale_fill_identity() +
+  scale_color_identity() +
+  labs(x = "Offensive Efficiency",
+       y = "Defensive Efficiency")
+```
+
+#### Let's make some shot charts! The greatest part of the `gamezoneR` package is how many shot locations (x, y) are charted. Let's look at Duke's shot attempts this season:
+
+```{r}
+# Find Duke game IDs
+duke_game_ids <- games %>% 
+  dplyr::filter(team == "Duke") %>% 
+  dplyr::pull(game_id)
+
+# Find Duke shot attempts
+duke_shots <- pbp %>% 
+  dplyr::filter(game_id %in% duke_game_ids) %>% 
+  dplyr::filter(!is.na(loc_x), event_team == "Duke")
+```
+
+Here is a *very* basic shot chart for Duke:
+
+```{r}
+duke_shots_filtered <- duke_shots %>% 
+  group_by(shooter) %>% 
+  mutate(shots = n()) %>% 
+  ungroup() %>% 
+  filter(shots >= 100)
+
+gamezoneR::base_court +
+  geom_point(data = duke_shots_filtered,
+             aes(loc_x, loc_y, color = shot_outcome),
+             alpha = 0.5) +
+  facet_wrap(~ shooter) +
+  scale_color_manual(values = c("green", "red")) +
+  theme(strip.text = element_text(size = 9),
+        legend.spacing.x = grid::unit(0, 'cm'),
+        legend.title = ggplot2::element_text(size = 20/ggplot2::.pt, face = "bold"),
+        legend.text = ggplot2::element_text(size = 16/ggplot2::.pt))
+```
+
+#### Play around with different versions of shot charts. Make some by a particular shooter, by a particular game, etc.
+
+```{r}
+
+```
+
+I encourage you to explore the data more! Answer questions you find interesting! While making this tutorial I decided to look into free throw attempt rates by home and away, specifically looking at Duke and the Cameron Crazies.
+
+```{r}
+games_summarized %>% 
+  dplyr::filter(opponent == "Duke") %>% 
+  dplyr::group_by(opponent, location) %>% 
+  dplyr::summarise(games = dplyr::n(),
+                   fta = mean(fta),
+                   .groups = "drop")
+
+games_summarized %>% 
+  dplyr::filter(team == "Duke") %>% 
+  dplyr::group_by(team, location) %>% 
+  dplyr::summarise(games = dplyr::n(),
+                   fta = mean(fta),
+                   .groups = "drop")
+```
+
+I then made a plot which I posted on [twitter](https://twitter.com/jacklich10/status/1495465026588655621?s=20&t=g2ZFc377ItxtnwNA7l8tSQ). This is the code for the plot, if interested.
+
+```{r}
+# If ggtext is not installed, install
+if (!require("ggtext")) {
+  install.packages("ggtext")
+}
+
+# Find all Duke opponents
+duke_opponents <- games %>% 
+  dplyr::filter(team == "Duke") %>% 
+  dplyr::pull(opponent)
+
+# Duke color
+duke_color <- gamezoneR::mbb_team_info$primary_color[gamezoneR::mbb_team_info$team_name == "Duke"]
+
+# Duke fill
+duke_fill <- gamezoneR::mbb_team_info$tertiary_color[gamezoneR::mbb_team_info$team_name == "Duke"]
+
+# Find Duke opponent free throw attempts by home/away, playing Duke/not Duke
+duke_opp_fta <- games_summarized %>% 
+  dplyr::filter(team %in% duke_opponents) %>% 
+  dplyr::mutate(playing_duke = ifelse(opponent == "Duke", "duke", "others")) %>% 
+  dplyr::group_by(location = ifelse(location == "home", "Opponent playing\nat home", "Opponent playing\non road"), playing_duke) %>% 
+  dplyr::summarise(games = dplyr::n(),
+                   fta = mean(fta),
+                   .groups = "drop")
+
+duke_opp_fta %>% 
+  tidyr::pivot_wider(names_from = playing_duke,
+                     values_from = c(games, fta)) %>% 
+  ggplot(aes(y = location)) +
+  ggtext::geom_richtext(aes(x = fta_duke, 
+                            label = ifelse(location == "Opponent playing\non road", "@ Duke", "vs. Duke"),
+                            vjust = ifelse(location == "away", -1.75, 2.25)),
+                        size = 3.5, hjust = 0.5,
+                        fill = NA, label.color = NA, # remove background and outline
+                        label.padding = grid::unit(rep(0, 4), "pt")) +
+  ggtext::geom_richtext(aes(x = fta_others, 
+                            label = ifelse(location == "Opponent playing\non road", "@ All other teams", "vs. All other teams")),
+                        size = 3.5, vjust = -1.75, hjust = 0.5,
+                        fill = NA, label.color = NA, # remove background and outline
+                        label.padding = grid::unit(rep(0, 4), "pt")) +
+  geom_segment(aes(fta_duke, xend = fta_others, yend = location),
+               color = "black") +
+  geom_point(aes(fta_duke, size = games_duke,
+                 color = duke_color, fill = duke_fill),
+             stroke = 0.8, pch = 21) +
+  geom_point(aes(fta_others, size = games_others),
+             stroke = 0.8, pch = 21, fill = "grey50") +
+  geom_text(aes(fta_duke, label = scales::number(fta_duke, accuracy = 0.1)),
+            size = 3, color = "white") +
+  geom_text(aes(fta_others, label = scales::number(fta_others, accuracy = 0.1)),
+            size = 3, color = "white") +
+  scale_size_continuous(range = c(7, 12)) +
+  scale_x_continuous(labels = scales::dollar,
+                     expand = expansion(mult = c(0.15, 0.15))) +
+  scale_color_identity() +
+  scale_fill_identity() +
+  guides(shape = guide_legend(override.aes = list(size = 0.25))) +
+  theme(axis.title.y = element_text(angle = 0, vjust = 0.5),
+        legend.position = c(0.3, 0.15),
+        legend.direction = "horizontal") +
+  labs(title = "The Cameron Crazies are making a difference",
+       subtitle = "2021-22 men's college basketball season",
+       x = "Duke opponent free throw attempts per game",
+       y = NULL,
+       size = "Number\nof games",
+       caption = "Chart: Jack Lichtenstein (@jacklich10) | Data: @gamezoneR")
+```
+
+#### Go explore the data yourself! Visualize where teams like to shoot from relative to league average. Visualize where teams are most efficient shooting from. Look at free throw attempt rates for other teams. Do whatever interests you! 
